@@ -2,7 +2,7 @@ import streamlit as st
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
-import cv2  # Only works if opencv-python-headless is installed
+import cv2  # Use opencv-python-headless in requirements
 
 st.set_page_config(layout="wide")
 st.title("🍎 Fruit Spoilage Detection & Histogram Analysis")
