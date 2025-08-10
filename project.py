@@ -1,234 +1,235 @@
 import streamlit as st
+import cv2
 import numpy as np
+from io import BytesIO
 from PIL import Image
 import matplotlib.pyplot as plt
-import cv2
+import os
+from scipy import ndimage
 
-st.set_page_config(layout="wide")
-st.title("🍎 Advanced Fruit Spoilage Detection & Color Analysis")
+# --- Utils ---
+def allowed_file(filename):
+    ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# ----------------------
-# Calculate grayscale histogram
-# ----------------------
-def calculate_histogram(image):
-    hist = cv2.calcHist([image], [0], None, [256], [0, 256])
-    return hist
+def pil_to_cv2(image):
+    """Convert PIL Image to OpenCV format"""
+    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
-# ----------------------
-# Detect spoilage area with adjustable HSV range
-# ----------------------
-def detect_spoilage_area(image, lower_brown, upper_brown):
-    blurred = cv2.GaussianBlur(image, (7, 7), 0)
-    hsv = cv2.cvtColor(blurred, cv2.COLOR_RGB2HSV)
-    mask = cv2.inRange(hsv, lower_brown, upper_brown)
-    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-    return mask, dist
+def cv2_to_pil(image):
+    """Convert OpenCV BGR image to PIL RGB Image"""
+    return Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
 
-# ----------------------
-# Apply sharpening with adjustable intensity
-# ----------------------
-def apply_sharpening(image, intensity=1):
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]])
-    kernel = kernel * intensity
-    sharpened = cv2.filter2D(image, -1, kernel)
-    return sharpened
+def plot_histogram(image):
+    """Plot and return histogram as a PIL image"""
+    hist_b = cv2.calcHist([image], [0], None, [256], [0, 256])
+    hist_g = cv2.calcHist([image], [1], None, [256], [0, 256])
+    hist_r = cv2.calcHist([image], [2], None, [256], [0, 256])
 
-# ----------------------
-# Apply smoothing filters
-# ----------------------
-def apply_smoothing(image, method="Gaussian", ksize=3):
-    if method == "Gaussian":
-        return cv2.GaussianBlur(image, (ksize, ksize), 0)
-    elif method == "Median":
-        return cv2.medianBlur(image, ksize)
-    elif method == "Bilateral":
-        return cv2.bilateralFilter(image, d=ksize, sigmaColor=75, sigmaSpace=75)
-    else:
-        return image
+    plt.figure(figsize=(6,4))
+    plt.plot(hist_b, color='blue', label='Blue', alpha=0.7)
+    plt.plot(hist_g, color='green', label='Green', alpha=0.7)
+    plt.plot(hist_r, color='red', label='Red', alpha=0.7)
+    plt.xlabel('Pixel Intensity')
+    plt.ylabel('Frequency')
+    plt.title('Color Histogram Analysis')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
 
-# ----------------------
-# Histogram equalization
-# ----------------------
-def equalize_histogram(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    eq = cv2.equalizeHist(gray)
-    eq_color = cv2.cvtColor(eq, cv2.COLOR_GRAY2RGB)
-    return eq_color
+    buf = BytesIO()
+    plt.savefig(buf, format='png')
+    plt.close()
+    buf.seek(0)
+    return Image.open(buf)
 
-# ----------------------
-# Edge detection (Canny)
-# ----------------------
-def edge_detection(image, low_threshold=100, high_threshold=200):
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    edges = cv2.Canny(gray, low_threshold, high_threshold)
-    return edges
+# --- Core Detector Class ---
+class FruitSpoilageDetector:
+    def __init__(self, image):
+        """
+        image: OpenCV BGR image
+        """
+        self.image = image
+        self.image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-# ----------------------
-# Morphological operations
-# ----------------------
-def morph_operation(mask, op, kernel_size=3):
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    if op == "Erosion":
-        return cv2.erode(mask, kernel, iterations=1)
-    elif op == "Dilation":
-        return cv2.dilate(mask, kernel, iterations=1)
-    elif op == "Opening":
-        return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    elif op == "Closing":
-        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    else:
-        return mask
+    def color_analysis(self):
+        hsv = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
+        
+        healthy_ranges = [
+            ([35, 40, 40], [85, 255, 255]),    # Green
+            ([15, 40, 40], [35, 255, 255]),    # Yellow/Orange
+            ([0, 40, 40], [15, 255, 255]),     # Red
+            ([165, 40, 40], [180, 255, 255])   # Red upper range
+        ]
+        
+        spoilage_ranges = [
+            ([10, 100, 20], [30, 255, 180]),   # Brown/rot wider
+            ([0, 0, 0], [180, 255, 50])        # Dark/mold
+        ]
+        
+        gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+        _, fruit_mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+        
+        healthy_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        spoilage_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        
+        for lower, upper in healthy_ranges:
+            mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+            healthy_mask = cv2.bitwise_or(healthy_mask, mask)
+        for lower, upper in spoilage_ranges:
+            mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+            spoilage_mask = cv2.bitwise_or(spoilage_mask, mask)
+        
+        healthy_mask = cv2.bitwise_and(healthy_mask, healthy_mask, mask=fruit_mask)
+        spoilage_mask = cv2.bitwise_and(spoilage_mask, spoilage_mask, mask=fruit_mask)
+        
+        total_fruit_pixels = np.sum(fruit_mask > 0)
+        if total_fruit_pixels == 0:
+            total_fruit_pixels = 1
+        
+        healthy_pct = (np.sum(healthy_mask > 0) / total_fruit_pixels) * 100
+        spoilage_pct = (np.sum(spoilage_mask > 0) / total_fruit_pixels) * 100
+        
+        color_analysis_img = self.image_rgb.copy()
+        color_analysis_img[spoilage_mask > 0] = [255, 0, 0]  # Mark spoilage in red
+        
+        return healthy_pct, spoilage_pct, color_analysis_img, spoilage_mask
 
-# ----------------------
-# Spot detection from mask (connected components)
-# ----------------------
-def detect_spots(mask):
-    # Connected components on binary mask
-    num_labels, labels_im = cv2.connectedComponents(mask)
-    # Subtract 1 because background is counted as label 0
-    spot_count = num_labels - 1
-    return spot_count, labels_im
+    def spatial_filtering(self):
+        gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5,5), 0)
+        edges = cv2.Canny(blurred, 50, 150)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+        morph = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+        adaptive_thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                               cv2.THRESH_BINARY_INV, 11, 2)
+        return blurred, edges, morph, adaptive_thresh
 
-# ----------------------
-# Color analysis: dominant color and stats
-# ----------------------
-def analyze_colors(image):
-    # Convert to HSV
-    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-    h, s, v = cv2.split(hsv)
-    dominant_hue = int(np.median(h))
-    mean_saturation = int(np.mean(s))
-    mean_value = int(np.mean(v))
-    return dominant_hue, mean_saturation, mean_value
+    def histogram_analysis(self):
+        mean_intensity = np.mean(self.image)
+        std_intensity = np.std(self.image)
+        hist_img = plot_histogram(self.image)
+        return mean_intensity, std_intensity, hist_img
 
-# ----------------------
-# Show histogram comparison
-# ----------------------
-def show_histogram_comparison(images, filenames):
-    st.subheader("📊 Histogram Comparison Over Days")
-    fig, ax = plt.subplots(figsize=(10, 4))
-    for i, img in enumerate(images):
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        hist = calculate_histogram(gray)
-        ax.plot(hist, label=filenames[i])
-    ax.set_title("Histogram Comparison")
-    ax.set_xlim([0, 256])
-    ax.legend()
-    st.pyplot(fig)
+    def distance_transform(self, spoilage_mask):
+        dist_transform = cv2.distanceTransform(spoilage_mask, cv2.DIST_L2, 5)
+        dist_normalized = cv2.normalize(dist_transform, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        dist_colored = cv2.applyColorMap(dist_normalized, cv2.COLORMAP_JET)
+        
+        max_distance = np.max(dist_transform)
+        mean_distance = np.mean(dist_transform[dist_transform > 0]) if np.sum(dist_transform > 0) > 0 else 0
+        
+        return dist_colored, max_distance, mean_distance
 
-# ----------------------
-# Main app
-# ----------------------
-def main():
-    uploaded_files = st.file_uploader(
-        "Upload daily fruit images", 
-        type=["png", "jpg", "jpeg"], 
-        accept_multiple_files=True
-    )
+    def detect_spoilage_spots(self):
+        gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (7,7), 0)
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+        
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area = 50
+        spots = [c for c in contours if cv2.contourArea(c) > min_area]
+        
+        spot_image = self.image_rgb.copy()
+        cv2.drawContours(spot_image, spots, -1, (255, 0, 0), 2)
+        
+        total_spoilage_area = sum([cv2.contourArea(c) for c in spots])
+        total_image_area = self.image.shape[0] * self.image.shape[1]
+        spoilage_area_pct = (total_spoilage_area / total_image_area) * 100
+        
+        return len(spots), spoilage_area_pct, spot_image
 
-    st.sidebar.header("Filter & Detection Settings")
+    def process_all(self):
+        healthy_pct, spoilage_pct, color_img, spoilage_mask = self.color_analysis()
+        blurred, edges, morph, adaptive_thresh = self.spatial_filtering()
+        mean_intensity, std_intensity, hist_img = self.histogram_analysis()
+        dist_img, max_dist, mean_dist = self.distance_transform(spoilage_mask)
+        num_spots, spoilage_area_pct, spot_img = self.detect_spoilage_spots()
 
-    # Sharpening settings
-    sharpening_intensity = st.sidebar.slider("Sharpening Intensity", 0, 5, 1, 1)
+        spoilage_score = (
+            spoilage_pct * 0.5 +
+            spoilage_area_pct * 0.35 +
+            min(max_dist * 2, 15)
+        )
+        spoilage_score = min(spoilage_score, 100)
 
-    # Smoothing filter options
-    smoothing_method = st.sidebar.selectbox(
-        "Smoothing Filter Method", 
-        ["None", "Gaussian", "Median", "Bilateral"]
-    )
-    smoothing_ksize = st.sidebar.slider("Smoothing Kernel Size (odd)", 3, 15, 3, 2)
-    smoothing_ksize = smoothing_ksize if smoothing_ksize % 2 == 1 else smoothing_ksize + 1
+        if spoilage_score < 5:
+            freshness_level = "Fresh"
+            freshness_color = "#4CAF50"
+        elif spoilage_score < 20:
+            freshness_level = "Slightly Aged"
+            freshness_color = "#FFC107"
+        elif spoilage_score < 40:
+            freshness_level = "Moderately Spoiled"
+            freshness_color = "#FF9800"
+        else:
+            freshness_level = "Heavily Spoiled"
+            freshness_color = "#F44336"
 
-    # Histogram Equalization
-    do_hist_eq = st.sidebar.checkbox("Apply Histogram Equalization")
+        return {
+            "spoilage_score": round(spoilage_score, 2),
+            "freshness_level": freshness_level,
+            "freshness_color": freshness_color,
+            "healthy_percentage": round(healthy_pct, 2),
+            "spoilage_percentage": round(spoilage_pct, 2),
+            "num_spots": num_spots,
+            "spoilage_area_percentage": round(spoilage_area_pct, 2),
+            "max_distance": round(max_dist, 2),
+            "mean_intensity": round(mean_intensity, 2),
+            "color_analysis_image": color_img,
+            "edges_image": edges,
+            "morph_image": morph,
+            "distance_transform_image": dist_img,
+            "spots_detected_image": spot_img,
+            "histogram_image": hist_img
+        }
 
-    # Edge detection thresholds
-    st.sidebar.markdown("### Edge Detection (Canny)")
-    edge_low = st.sidebar.slider("Low Threshold", 50, 200, 100)
-    edge_high = st.sidebar.slider("High Threshold", 100, 300, 200)
+# --- Streamlit UI ---
 
-    # Morphological operations
-    st.sidebar.markdown("### Morphological Operation on Spoilage Mask")
-    morph_op = st.sidebar.selectbox("Operation", ["None", "Erosion", "Dilation", "Opening", "Closing"])
-    morph_kernel = st.sidebar.slider("Morph Kernel Size", 3, 15, 3, 2)
-    morph_kernel = morph_kernel if morph_kernel % 2 == 1 else morph_kernel + 1
+st.title("Fruit Spoilage Estimator Using Image Filtering")
 
-    # Spoilage HSV range tuning
-    st.sidebar.markdown("### Spoilage HSV Range (Brown Color)")
-    h_lower = st.sidebar.slider("Hue Lower", 0, 179, 10)
-    s_lower = st.sidebar.slider("Saturation Lower", 0, 255, 50)
-    v_lower = st.sidebar.slider("Value Lower", 0, 255, 50)
-    h_upper = st.sidebar.slider("Hue Upper", 0, 179, 30)
-    s_upper = st.sidebar.slider("Saturation Upper", 0, 255, 255)
-    v_upper = st.sidebar.slider("Value Upper", 0, 255, 200)
+uploaded_file = st.file_uploader("Upload a fruit image", type=['png', 'jpg', 'jpeg', 'bmp', 'gif'])
 
-    lower_brown = np.array([h_lower, s_lower, v_lower])
-    upper_brown = np.array([h_upper, s_upper, v_upper])
+if uploaded_file is not None:
+    image_pil = Image.open(uploaded_file).convert('RGB')
+    image_cv2 = pil_to_cv2(image_pil)
+    
+    detector = FruitSpoilageDetector(image_cv2)
+    
+    with st.spinner("Analyzing image..."):
+        results = detector.process_all()
 
-    if uploaded_files:
-        images = []
-        filenames = []
+    # Show original image
+    st.subheader("Original Image")
+    st.image(image_pil, use_column_width=True)
 
-        for file in uploaded_files:
-            image = Image.open(file).convert("RGB").resize((512, 512))
-            img_np = np.array(image)
+    # Spoilage Score and freshness level
+    st.markdown(f"### Spoilage Score: {results['spoilage_score']} / 100")
+    st.markdown(f"<span style='color:{results['freshness_color']};font-weight:bold;'>Freshness Level: {results['freshness_level']}</span>", unsafe_allow_html=True)
+    
+    st.markdown(f"Healthy area: {results['healthy_percentage']}%")
+    st.markdown(f"Spoilage area (color analysis): {results['spoilage_percentage']}%")
+    st.markdown(f"Number of spoilage spots detected: {results['num_spots']}")
+    st.markdown(f"Spoilage area (spot detection): {results['spoilage_area_percentage']}%")
+    st.markdown(f"Max distance of spoilage spread: {results['max_distance']}")
+    st.markdown(f"Mean image intensity: {results['mean_intensity']}")
 
-            # Sharpening
-            if sharpening_intensity > 0:
-                img_np = apply_sharpening(img_np, intensity=sharpening_intensity)
+    # Display processed images side-by-side
+    st.subheader("Processed Images")
 
-            # Smoothing
-            if smoothing_method != "None":
-                img_np = apply_smoothing(img_np, smoothing_method, smoothing_ksize)
+    col1, col2 = st.columns(2)
 
-            # Histogram Equalization
-            if do_hist_eq:
-                img_np = equalize_histogram(img_np)
+    with col1:
+        st.image(results['color_analysis_image'], caption="Color Analysis (Spoilage marked in red)", use_column_width=True)
+        st.image(results['edges_image'], caption="Edges (Canny)", use_column_width=True)
+        st.image(results['distance_transform_image'], caption="Distance Transform (Spoilage Spread)", use_column_width=True)
 
-            images.append(img_np)
-            filenames.append(file.name)
+    with col2:
+        st.image(results['morph_image'], caption="Morphological Top-hat", use_column_width=True)
+        st.image(results['spots_detected_image'], caption="Spoilage Spots Detection", use_column_width=True)
+        st.image(results['histogram_image'], caption="Color Histogram", use_column_width=True)
 
-        show_histogram_comparison(images, filenames)
-
-        st.subheader("🧪 Spoilage & Color Analysis Results")
-
-        for i, img in enumerate(images):
-            # Spoilage detection
-            mask, dist = detect_spoilage_area(img, lower_brown, upper_brown)
-
-            # Morphological operation
-            if morph_op != "None":
-                mask = morph_operation(mask, morph_op, morph_kernel)
-
-            # Edge detection
-            edges = edge_detection(img, edge_low, edge_high)
-
-            # Spot detection
-            spot_count, labels_im = detect_spots(mask)
-
-            # Color analysis
-            dominant_hue, mean_saturation, mean_value = analyze_colors(img)
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.image(img, caption="Processed Image", use_column_width=True)
-                st.markdown(f"**Color Analysis:**")
-                st.markdown(f"- Dominant Hue: {dominant_hue}")
-                st.markdown(f"- Mean Saturation: {mean_saturation}")
-                st.markdown(f"- Mean Value (Brightness): {mean_value}")
-            with col2:
-                st.image(mask, caption="Spoilage Mask (Morph Applied)", use_column_width=True, clamp=True)
-                st.markdown(f"**Detected Spoilage Spots:** {spot_count}")
-            with col3:
-                st.image(dist, caption="Distance Transform", use_column_width=True, clamp=True)
-                st.image(edges, caption="Edge Detection (Canny)", use_column_width=True, clamp=True)
-
-            st.markdown(f"**Image:** {filenames[i]}")
-            st.markdown("---")
-    else:
-        st.info("Please upload one or more fruit images to begin.")
-
-if __name__ == "__main__":
-    main()
+else:
+    st.info("Please upload an image to begin analysis.")
