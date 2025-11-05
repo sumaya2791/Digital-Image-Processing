@@ -101,14 +101,7 @@ if uploaded_file and allowed_file(uploaded_file.name):
         with col3:
             st.image(morph, caption="Morphological Top-Hat", use_column_width=True, clamp=True)
             st.image(adaptive_thresh, caption="Adaptive Threshold", use_column_width=True, clamp=True)
-
-        # Frequency Analysis
-        st.subheader("🌀 Frequency Domain Analysis")
-        fig2, ax2 = plt.subplots(figsize=(6, 5))
-        ax2.imshow(magnitude_spectrum, cmap='gray')
-        ax2.set_title("Magnitude Spectrum (FFT)")
-        ax2.axis('off')
-        st.pyplot(fig2)
+       
 
         # Spoilage Result
         st.markdown(f"### 🧾 Estimated Spoilage Score: **{spoilage_score:.2f}%**")
