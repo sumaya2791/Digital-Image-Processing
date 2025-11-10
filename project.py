@@ -3,172 +3,154 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
-# =================== Utility ===================
+# ------------------------- Utility -------------------------
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp'}
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-TARGET_SIZE = (400, 400)
-def resize_fixed(img):
-    return cv2.resize(img, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+# ------------------------- Spatial Filters -------------------------
+def spatial_filtering(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-# =================== Homomorphic Filter ===================
-def homomorphic(image_gray):
-    """
-    image_gray: single-channel uint8 image.
-    Returns uint8 illumination-corrected image.
-    """
-    # ensure float in [0,1]
-    img = image_gray.astype(np.float32) / 255.0
-    # log domain
-    img_log = np.log1p(img)
+    # Gaussian Blur for denoising
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # frequency transform
-    dft = np.fft.fft2(img_log)
-    dft_shift = np.fft.fftshift(dft)
+    # Sobel Filter (edge gradients)
+    sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+    sobel_combined = cv2.magnitude(sobelx, sobely)
+    sobel_combined = cv2.convertScaleAbs(sobel_combined)
 
-    rows, cols = image_gray.shape
-    crow, ccol = rows // 2, cols // 2
+    # Laplacian (detects fine surface defects)
+    laplacian = cv2.Laplacian(blurred, cv2.CV_64F)
+    laplacian = cv2.convertScaleAbs(laplacian)
 
-    # create a simple high-pass mask (suppress low freq near center)
-    mask = np.ones((rows, cols), np.float32)
-    r = max(15, min(rows, cols) // 10)
-    cv2.circle(mask, (ccol, crow), r, 0, -1)
+    # Canny Edge Detection
+    edges = cv2.Canny(blurred, 50, 150)
 
-    filtered = dft_shift * mask
-    f_ishift = np.fft.ifftshift(filtered)
-    img_back = np.fft.ifft2(f_ishift)
-    img_back = np.real(img_back)
+    # Morphological enhancement (Top Hat)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    morph = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
 
-    # exponentiate and scale back
-    img_exp = np.expm1(img_back)  # inverse of log1p
-    # sometimes values go out of range; normalize safely
-    img_exp = np.nan_to_num(img_exp, nan=0.0, posinf=0.0, neginf=0.0)
-    img_exp = img_exp - img_exp.min()
-    if img_exp.max() > 0:
-        img_exp = img_exp / img_exp.max()
+    # Adaptive Thresholding for dark/bright contrast
+    adaptive_thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
 
-    img_out = np.uint8(np.clip(img_exp * 255.0, 0, 255))
-    return img_out
+    return blurred, sobel_combined, laplacian, edges, morph, adaptive_thresh
 
-# =================== Defect Filters ===================
-def detect_dark_spots(gray):
-    bl = cv2.GaussianBlur(gray, (5, 5), 0)
-    lap = cv2.Laplacian(bl, cv2.CV_64F)
-    lap = cv2.convertScaleAbs(lap)
-    _, mask = cv2.threshold(lap, 25, 255, cv2.THRESH_BINARY)
-    return mask
+# ------------------------- Color & Texture Analysis -------------------------
+def analyze_color_texture(image):
+    # Convert to HSV for color analysis
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
 
-def detect_wrinkles(gray):
-    k = cv2.getGaborKernel((25, 25), 4.0, np.pi / 2, 10.0, 0.5, 0, cv2.CV_32F)
-    filtered = cv2.filter2D(gray, ddepth=cv2.CV_8U, kernel=k)
-    _, mask = cv2.threshold(filtered, 40, 255, cv2.THRESH_BINARY)
-    return mask
+    mean_hue = np.mean(h)
+    mean_sat = np.mean(s)
+    mean_val = np.mean(v)
 
-def detect_mold(gray):
-    # Difference of Gaussians
-    g1 = cv2.GaussianBlur(gray, (3, 3), 0)
-    g2 = cv2.GaussianBlur(gray, (9, 9), 0)
-    dog = cv2.absdiff(g1, g2)
-    _, mask = cv2.threshold(dog, 15, 255, cv2.THRESH_BINARY)
-    return mask
-
-def detect_color_loss(image):
+    # Convert to LAB (perceptual lightness)
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    L, A, B = cv2.split(lab)
-    mean_L = np.mean(L).astype(np.uint8)
-    delta = cv2.absdiff(L, mean_L)
-    _, mask = cv2.threshold(delta, 18, 255, cv2.THRESH_BINARY)
-    return mask
+    l, a, b = cv2.split(lab)
+    mean_lightness = np.mean(l)
 
-# =================== Spoilage Score ===================
-def compute_spoilage_score(mask):
-    total_pixels = mask.size
-    spoiled_pixels = np.count_nonzero(mask)
-    ratio = spoiled_pixels / total_pixels if total_pixels > 0 else 0.0
-    score = int(np.clip(ratio * 100, 0, 100))
-    if score < 15:
-        return "🍏 Fresh", "Minor defects detected", score
-    elif score < 35:
-        return "🍊 Slightly Spoiled", "Moderate defects present", score
+    # Laplacian variance (measures roughness or blur)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+    return mean_hue, mean_sat, mean_lightness, lap_var
+
+# ------------------------- Spoilage Classification -------------------------
+def classify_spoilage(mean_hue, mean_sat, mean_lightness, lap_var):
+    """
+    Simple heuristic model:
+    - Low hue/saturation = discoloration
+    - Low lightness = dark, oxidized
+    - High Laplacian variance = rough texture (wrinkles/spots)
+    """
+    color_score = (mean_sat / 255) * 100
+    texture_score = np.clip(lap_var / 100, 0, 100)
+
+    # Weighted spoilage score (lower is fresher)
+    spoilage_score = (100 - color_score) * 0.6 + texture_score * 0.4
+
+    if spoilage_score < 30:
+        label = "🍏 Fresh"
+        desc = "✅ Bright color, smooth texture — fruit appears fresh."
+    elif 30 <= spoilage_score < 60:
+        label = "🍊 Slightly Spoiled"
+        desc = "🟠 Some color dullness or minor rough texture detected."
     else:
-        return "🍂 Heavily Spoiled", "Significant spoilage detected", score
+        label = "🍂 Heavily Spoiled"
+        desc = "⚠️ Dull color and uneven texture — high spoilage likelihood."
 
-# =================== Histogram ===================
+    return label, desc, spoilage_score
+
+# ------------------------- Histogram Plot -------------------------
 def plot_histogram(image):
+    color = ('b', 'g', 'r')
     fig, ax = plt.subplots(figsize=(8, 4))
-    for i, col in enumerate(('b', 'g', 'r')):
+    for i, col in enumerate(color):
         hist = cv2.calcHist([image], [i], None, [256], [0, 256])
         ax.plot(hist, color=col)
-    ax.set_xlim(0, 256)
+        ax.set_xlim([0, 256])
+    ax.set_title('Color Histogram')
+    ax.set_xlabel('Pixel Intensity')
+    ax.set_ylabel('Frequency')
     fig.tight_layout()
     return fig
 
-# =================== Streamlit App ===================
+# ------------------------- Streamlit App -------------------------
 st.set_page_config(page_title="Smart Fruit Spoilage Detector", layout="wide")
-st.title("🍎 Smart Fruit Spoilage Detection System — Improved")
+st.title("🍎 Smart Fruit Spoilage Detection System")
 
-uploaded = st.file_uploader("Upload a fruit image", type=list(ALLOWED_EXTENSIONS))
+uploaded_file = st.file_uploader("Upload a fruit image", type=list(ALLOWED_EXTENSIONS))
 
-if uploaded and allowed_file(uploaded.name):
-    buf = np.asarray(bytearray(uploaded.getvalue()), dtype=np.uint8)
-    image = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+if uploaded_file and allowed_file(uploaded_file.name):
+    file_bytes = np.asarray(bytearray(uploaded_file.getvalue()), dtype=np.uint8)
+    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
     if image is None:
-        st.error("Could not decode image.")
+        st.error("❌ Could not load the image. Please upload a valid file.")
     else:
-        image = resize_fixed(image)
-        st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Original (resized)", use_column_width=True)
+        st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption='Original Image', use_column_width=True)
 
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Apply filters
+        blurred, sobel, laplacian, edges, morph, adaptive_thresh = spatial_filtering(image)
 
-        # illumination correction
-        hm = homomorphic(gray)
+        # Filter Visualizations
+        st.markdown("### 🔍 Spatial Filter Results")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.image(blurred, caption="Gaussian Blur", use_column_width=True)
+            st.image(sobel, caption="Sobel Edge Detection", use_column_width=True)
+        with col2:
+            st.image(laplacian, caption="Laplacian Edge Map", use_column_width=True)
+            st.image(edges, caption="Canny Edges", use_column_width=True)
+        with col3:
+            st.image(morph, caption="Morphological Top Hat", use_column_width=True)
+            st.image(adaptive_thresh, caption="Adaptive Threshold", use_column_width=True)
 
-        # detect defects on illumination-normalized image
-        dark = detect_dark_spots(hm)
-        wrinkle = detect_wrinkles(hm)
-        mold = detect_mold(hm)
-        colorfade = detect_color_loss(image)
+        # Analysis
+        st.markdown("### 🧠 Color and Texture Analysis")
+        mean_hue, mean_sat, mean_lightness, lap_var = analyze_color_texture(image)
+        label, desc, spoilage_score = classify_spoilage(mean_hue, mean_sat, mean_lightness, lap_var)
 
-        # combine masks
-        combined = np.zeros_like(dark)
-        combined = cv2.bitwise_or(combined, dark)
-        combined = cv2.bitwise_or(combined, wrinkle)
-        combined = cv2.bitwise_or(combined, mold)
-        combined = cv2.bitwise_or(combined, colorfade)
+        col_a, col_b, col_c, col_d = st.columns(4)
+        col_a.metric("Mean Hue", f"{mean_hue:.2f}")
+        col_b.metric("Mean Saturation", f"{mean_sat:.2f}")
+        col_c.metric("Mean Lightness (LAB)", f"{mean_lightness:.2f}")
+        col_d.metric("Texture Variance", f"{lap_var:.2f}")
 
-        # optional smoothing/cleanup
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-
-        # ensure same size display
-        disp_hm = resize_fixed(hm)
-        disp_dark = resize_fixed(dark)
-        disp_wrinkle = resize_fixed(wrinkle)
-        disp_mold = resize_fixed(mold)
-        disp_colorfade = resize_fixed(colorfade)
-        disp_combined = resize_fixed(combined)
-
-        st.markdown("### 🔍 Defect Filters (uniform size)")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.image(disp_hm, caption="Illumination Normalized", use_column_width=True)
-        c2.image(disp_dark, caption="Dark Spots", use_column_width=True)
-        c3.image(disp_wrinkle, caption="Wrinkles", use_column_width=True)
-        c4.image(disp_mold, caption="Mold", use_column_width=True)
-        c5.image(disp_colorfade, caption="Color Fading", use_column_width=True)
-
-        st.markdown("### ✅ Combined Spoilage Mask")
-        st.image(disp_combined, caption="Combined Mask", use_column_width=True)
-
-        label, desc, score = compute_spoilage_score(combined)
-        st.subheader(f"Result: {label}")
+        st.markdown(f"### 🍇 Spoilage Classification: **{label}**")
         st.info(desc)
-        st.progress(score)
+        st.progress(int(np.clip(spoilage_score, 0, 100)))
 
+        # Histogram
         st.markdown("### 📊 Color Histogram")
-        st.pyplot(plot_histogram(image))
+        hist_fig = plot_histogram(image)
+        st.pyplot(hist_fig)
 
 else:
-    st.info("Upload a png/jpg/jpeg/bmp image.")
+    st.info("Please upload an image file (png, jpg, jpeg, bmp).")
