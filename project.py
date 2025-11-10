@@ -27,7 +27,6 @@ def overlay_mask_on_rgb(rgb, mask, color=(255, 0, 0), alpha=0.4):
     """
     Safely overlays a semi-transparent color on the RGB image wherever mask > 0.
     Works with 2D or 3D masks and auto-resizes the mask if needed.
-    Fixes the IndexError by avoiding advanced boolean indexing and using np.where.
     """
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError("rgb must be an HxWx3 array")
@@ -136,8 +135,9 @@ def compute_spoilage_map(image_bgr, weights=None, smooth_ksize=5):
     - prob_map: float32 0..1, per-pixel spoilage probability-like score
     - feature_maps: dict of intermediate maps for debugging
     """
+    # default weights (sum not required; final map is normalized)
     if weights is None:
-        weights = dict(lightness=0.35, saturation=0.2, texture=0.3, brown=0.15)
+        weights = dict(lightness=0.35, saturation=0.20, texture=0.30, brown=0.15)
 
     # Color spaces
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
@@ -152,9 +152,28 @@ def compute_spoilage_map(image_bgr, weights=None, smooth_ksize=5):
 
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # Laplacian for texture
     lap = cv2.Laplacian(gray_blur, cv2.CV_32F, ksize=3)
     lap_abs = np.abs(lap)
     lap_norm = normalize(lap_abs)
+
+    # Sobel magnitude for gradients / scratches
+    sobelx = cv2.Sobel(gray_blur, cv2.CV_32F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray_blur, cv2.CV_32F, 0, 1, ksize=3)
+    sobel_mag = cv2.magnitude(sobelx, sobely)
+    sobel_norm = normalize(sobel_mag)
+
+    # Canny edges as another indicator of surface defects (binary -> smooth)
+    canny = cv2.Canny(gray_blur, 50, 150)
+    # Smooth and normalize canny so it contributes as a soft feature
+    canny_blur = cv2.GaussianBlur(canny.astype(np.float32), (7, 7), 0)
+    canny_norm = normalize(canny_blur)
+
+    # Combine texture-related signals into a single texture score
+    # weighted fusion inside texture (weights chosen to prefer Laplacian a bit)
+    texture_comb = 0.55 * lap_norm + 0.30 * sobel_norm + 0.15 * canny_norm
+    texture_norm = normalize(texture_comb)
 
     # Normalize channels
     L_norm = l.astype(np.float32) / 255.0
@@ -170,25 +189,26 @@ def compute_spoilage_map(image_bgr, weights=None, smooth_ksize=5):
     # Individual contributions
     score_dark = 1.0 - L_norm            # darker -> more spoiled
     score_desat = 1.0 - S_norm           # lower saturation -> more spoiled
-    score_texture = lap_norm             # rough/uneven -> more spoiled
+    score_texture = texture_norm         # fused texture (lap + sobel + canny)
     score_brown = brown_score            # brownness in Lab
 
-    # Weighted fusion
+    # Weighted fusion (final map normalized afterwards)
     prob_map = (
-        weights['lightness'] * score_dark +
-        weights['saturation'] * score_desat +
-        weights['texture'] * score_texture +
-        weights['brown'] * score_brown
+        weights.get('lightness', 0.35) * score_dark +
+        weights.get('saturation', 0.20) * score_desat +
+        weights.get('texture', 0.30) * score_texture +
+        weights.get('brown', 0.15) * score_brown
     )
     prob_map = normalize(prob_map)
 
     # Optional smoothing (ensure odd kernel)
-    k = max(3, smooth_ksize | 1)
+    k = max(3, int(smooth_ksize) | 1)
     prob_map = cv2.GaussianBlur(prob_map, (k, k), 0)
 
     feature_maps = {
         "dark": score_dark, "desat": score_desat,
-        "texture": score_texture, "brown": score_brown
+        "texture": score_texture, "brown": score_brown,
+        "laplacian": lap_norm, "sobel": sobel_norm, "canny": canny_norm
     }
     return prob_map, feature_maps
 
@@ -277,6 +297,14 @@ morph_kernel = st.sidebar.slider("Morph kernel size", 3, 21, 7, step=2)
 overlay_alpha = st.sidebar.slider("Overlay opacity", 0.1, 0.9, 0.4, 0.05)
 show_debug = st.sidebar.checkbox("Show debug feature maps", value=False)
 show_filters = st.sidebar.checkbox("Show spatial filter results", value=False)
+show_edges_overlay = st.sidebar.checkbox("Overlay Canny edges on image", value=False)
+
+# Allow user to tweak fusion weights (optional small UI)
+st.sidebar.markdown("**Fusion weights (optional)**")
+w_light = st.sidebar.slider("Lightness weight", 0.0, 1.0, 0.35, 0.05)
+w_sat = st.sidebar.slider("Saturation weight", 0.0, 1.0, 0.20, 0.05)
+w_tex = st.sidebar.slider("Texture weight", 0.0, 1.0, 0.30, 0.05)
+w_brown = st.sidebar.slider("Brownness weight", 0.0, 1.0, 0.15, 0.05)
 
 # ------------------------- File Uploader -------------------------
 uploaded_file = st.file_uploader("Upload a fruit image", type=list(ALLOWED_EXTENSIONS))
@@ -292,18 +320,32 @@ if uploaded_file and allowed_file(uploaded_file.name):
         st.image(image_rgb, caption='Original Image', use_column_width=True)
 
         # Improved segmentation
+        weights = dict(lightness=w_light, saturation=w_sat, texture=w_tex, brown=w_brown)
         mask, prob_map, contours = segment_spoilage(
             image_bgr,
             sensitivity=sensitivity,
             min_area=min_area,
             morph_kernel=morph_kernel,
-            weights=dict(lightness=0.35, saturation=0.20, texture=0.30, brown=0.15)
+            weights=weights
         )
+
+        # Also compute spatial filters for optional display / overlay
+        blurred, sobel, laplacian, edges, morph, adaptive_thresh = spatial_filtering(image_bgr)
 
         # Visualizations
         st.markdown("### 🧪 Spoilage Detection & Visualization")
         overlay_rgb = overlay_mask_on_rgb(image_rgb, mask, color=(255, 0, 0), alpha=overlay_alpha)
-        boxed_rgb, _ = draw_contours_and_boxes(overlay_rgb, mask, min_area=min_area, thickness=2)
+
+        # Optionally overlay canny edges (thin cyan) for visual confirmation
+        if show_edges_overlay:
+            edges_color = np.zeros_like(image_rgb)
+            edges_color[edges > 0] = (0, 255, 255)  # cyan-ish in RGB
+            overlay_with_edges = cv2.addWeighted(overlay_rgb, 1.0, edges_color, 0.5, 0)
+            display_rgb = overlay_with_edges
+        else:
+            display_rgb = overlay_rgb
+
+        boxed_rgb, _ = draw_contours_and_boxes(display_rgb, mask, min_area=min_area, thickness=2)
         heat_rgb = colorize_heatmap(prob_map)
         # Blend full heatmap over the image for better visualization
         heat_overlay = cv2.addWeighted(image_rgb, 1 - overlay_alpha, heat_rgb, overlay_alpha, 0)
@@ -330,13 +372,18 @@ if uploaded_file and allowed_file(uploaded_file.name):
 
         # Optional debug feature maps
         if show_debug:
-            _, fmap = compute_spoilage_map(image_bgr, smooth_ksize=5)
+            _, fmap = compute_spoilage_map(image_bgr, weights=weights, smooth_ksize=5)
             st.markdown("### 🧩 Debug Feature Maps")
             d1, d2, d3, d4 = st.columns(4)
             d1.image((normalize(fmap["dark"]) * 255).astype(np.uint8), caption="Darkness (1-L)", use_column_width=True, clamp=True)
             d2.image((normalize(fmap["desat"]) * 255).astype(np.uint8), caption="Desaturation (1-S)", use_column_width=True, clamp=True)
-            d3.image((normalize(fmap["texture"]) * 255).astype(np.uint8), caption="Texture (Laplacian)", use_column_width=True, clamp=True)
+            d3.image((normalize(fmap["texture"]) * 255).astype(np.uint8), caption="Texture (Laplacian+Sobel+Canny)", use_column_width=True, clamp=True)
             d4.image((normalize(fmap["brown"]) * 255).astype(np.uint8), caption="Brownness (Lab)", use_column_width=True, clamp=True)
+            # extra maps
+            e1, e2, e3 = st.columns(3)
+            e1.image((normalize(fmap["laplacian"]) * 255).astype(np.uint8), caption="Laplacian", use_column_width=True, clamp=True)
+            e2.image((normalize(fmap["sobel"]) * 255).astype(np.uint8), caption="Sobel Magnitude", use_column_width=True, clamp=True)
+            e3.image((normalize(fmap["canny"]) * 255).astype(np.uint8), caption="Canny (soft)", use_column_width=True, clamp=True)
 
         # Keep original analysis
         st.markdown("### 🧠 Color and Texture Analysis")
@@ -350,14 +397,13 @@ if uploaded_file and allowed_file(uploaded_file.name):
         # Optional: show original spatial filter results
         if show_filters:
             st.markdown("### 🔍 Spatial Filter Results")
-            blurred, sobel, laplacian, edges, morph, adaptive_thresh = spatial_filtering(image_bgr)
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.image(blurred, caption="Gaussian Blur", use_column_width=True, clamp=True)
-                st.image(sobel, caption="Sobel Edge Detection", use_column_width=True, clamp=True)
+                st.image(sobel, caption="Sobel Edge Detection (abs)", use_column_width=True, clamp=True)
             with col2:
                 st.image(laplacian, caption="Laplacian Edge Map", use_column_width=True, clamp=True)
-                st.image(edges, caption="Canny Edges", use_column_width=True, clamp=True)
+                st.image(edges, caption="Canny Edges (binary)", use_column_width=True, clamp=True)
             with col3:
                 st.image(morph, caption="Morphological Top Hat", use_column_width=True, clamp=True)
                 st.image(adaptive_thresh, caption="Adaptive Threshold", use_column_width=True, clamp=True)
@@ -369,3 +415,4 @@ if uploaded_file and allowed_file(uploaded_file.name):
 
 else:
     st.info("Please upload an image file (png, jpg, jpeg, bmp).")
+
