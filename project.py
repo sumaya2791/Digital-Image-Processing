@@ -3,154 +3,144 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
-# ------------------------- Utility -------------------------
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp'}
+ALLOWED_EXTENSIONS = {'png','jpg','jpeg','bmp'}
 def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    return '.' in filename and filename.rsplit('.',1)[1].lower() in ALLOWED_EXTENSIONS
 
 # ------------------------- Spatial Filters -------------------------
 def spatial_filtering(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # Gaussian Blur for denoising
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    blurred = cv2.GaussianBlur(gray,(5,5),0)
 
-    # Sobel Filter (edge gradients)
-    sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
-    sobely = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
-    sobel_combined = cv2.magnitude(sobelx, sobely)
-    sobel_combined = cv2.convertScaleAbs(sobel_combined)
+    sobelx = cv2.Sobel(blurred,cv2.CV_64F,1,0,ksize=3)
+    sobely = cv2.Sobel(blurred,cv2.CV_64F,0,1,ksize=3)
+    sobel = cv2.convertScaleAbs(cv2.magnitude(sobelx,sobely))
 
-    # Laplacian (detects fine surface defects)
-    laplacian = cv2.Laplacian(blurred, cv2.CV_64F)
-    laplacian = cv2.convertScaleAbs(laplacian)
+    laplacian = cv2.convertScaleAbs(cv2.Laplacian(blurred,cv2.CV_64F))
 
-    # Canny Edge Detection
-    edges = cv2.Canny(blurred, 50, 150)
+    edges = cv2.Canny(blurred,50,150)
 
-    # Morphological enhancement (Top Hat)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    morph = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(7,7))
+    morph = cv2.morphologyEx(gray,cv2.MORPH_TOPHAT,kernel)
 
-    # Adaptive Thresholding for dark/bright contrast
     adaptive_thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 2
+        blurred,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,11,2
     )
 
-    return blurred, sobel_combined, laplacian, edges, morph, adaptive_thresh
+    # CLAHE contrast
+    clahe_obj = cv2.createCLAHE(clipLimit=3.0,tileGridSize=(8,8))
+    clahe_img = clahe_obj.apply(gray)
+
+    # Otsu threshold
+    _, otsu = cv2.threshold(blurred,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+
+    # Gabor filter
+    gabor_kernel = cv2.getGaborKernel((21,21),4.0,np.pi/4,10.0,0.5,0,ktype=cv2.CV_32F)
+    gabor = cv2.filter2D(gray,CV_8UC3,gabor_kernel)
+
+    return blurred,sobel,laplacian,edges,morph,adaptive_thresh,clahe_img,otsu,gabor
 
 # ------------------------- Color & Texture Analysis -------------------------
 def analyze_color_texture(image):
-    # Convert to HSV for color analysis
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-
+    hsv = cv2.cvtColor(image,cv2.COLOR_BGR2HSV)
+    h,s,v = cv2.split(hsv)
     mean_hue = np.mean(h)
     mean_sat = np.mean(s)
-    mean_val = np.mean(v)
 
-    # Convert to LAB (perceptual lightness)
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
+    lab = cv2.cvtColor(image,cv2.COLOR_BGR2LAB)
+    l,a,b = cv2.split(lab)
     mean_lightness = np.mean(l)
 
-    # Laplacian variance (measures roughness or blur)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    gray = cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
+    lap_var = cv2.Laplacian(gray,cv2.CV_64F).var()
 
-    return mean_hue, mean_sat, mean_lightness, lap_var
+    # GLCM roughness proxy: local variance
+    local_var = cv2.Laplacian(gray,cv2.CV_64F).var()
+
+    return mean_hue,mean_sat,mean_lightness,lap_var,local_var
 
 # ------------------------- Spoilage Classification -------------------------
-def classify_spoilage(mean_hue, mean_sat, mean_lightness, lap_var):
-    """
-    Simple heuristic model:
-    - Low hue/saturation = discoloration
-    - Low lightness = dark, oxidized
-    - High Laplacian variance = rough texture (wrinkles/spots)
-    """
-    color_score = (mean_sat / 255) * 100
-    texture_score = np.clip(lap_var / 100, 0, 100)
+def classify_spoilage(mean_hue,mean_sat,mean_lightness,lap_var,local_var):
+    color_score = (mean_sat/255)*100
+    texture_score = np.clip((lap_var+local_var)/150,0,100)
 
-    # Weighted spoilage score (lower is fresher)
-    spoilage_score = (100 - color_score) * 0.6 + texture_score * 0.4
+    spoilage_score = (100 - color_score)*0.5 + texture_score*0.5
 
     if spoilage_score < 30:
-        label = "🍏 Fresh"
-        desc = "✅ Bright color, smooth texture — fruit appears fresh."
-    elif 30 <= spoilage_score < 60:
-        label = "🍊 Slightly Spoiled"
-        desc = "🟠 Some color dullness or minor rough texture detected."
+        label = "Fresh"
+        desc = "Color stable. Texture smooth."
+    elif spoilage_score < 60:
+        label = "Slightly Spoiled"
+        desc = "Color dullness or mild texture roughness."
     else:
-        label = "🍂 Heavily Spoiled"
-        desc = "⚠️ Dull color and uneven texture — high spoilage likelihood."
+        label = "Heavily Spoiled"
+        desc = "Low saturation and high texture deformation."
 
-    return label, desc, spoilage_score
+    return label,desc,spoilage_score
 
-# ------------------------- Histogram Plot -------------------------
+# ------------------------- Histogram -------------------------
 def plot_histogram(image):
-    color = ('b', 'g', 'r')
-    fig, ax = plt.subplots(figsize=(8, 4))
-    for i, col in enumerate(color):
-        hist = cv2.calcHist([image], [i], None, [256], [0, 256])
-        ax.plot(hist, color=col)
-        ax.set_xlim([0, 256])
-    ax.set_title('Color Histogram')
-    ax.set_xlabel('Pixel Intensity')
-    ax.set_ylabel('Frequency')
+    fig,ax = plt.subplots(figsize=(8,4))
+    for i,col in enumerate(('b','g','r')):
+        hist = cv2.calcHist([image],[i],None,[256],[0,256])
+        ax.plot(hist,color=col)
+    ax.set_xlim([0,256])
     fig.tight_layout()
     return fig
 
-# ------------------------- Streamlit App -------------------------
-st.set_page_config(page_title="Smart Fruit Spoilage Detector", layout="wide")
-st.title("🍎 Smart Fruit Spoilage Detection System")
+# ------------------------- Streamlit -------------------------
+st.set_page_config(page_title="Smart Fruit Spoilage Detector",layout="wide")
+st.title("Smart Fruit Spoilage Detection")
 
-uploaded_file = st.file_uploader("Upload a fruit image", type=list(ALLOWED_EXTENSIONS))
+uploaded_file = st.file_uploader("Upload image",type=list(ALLOWED_EXTENSIONS))
 
 if uploaded_file and allowed_file(uploaded_file.name):
-    file_bytes = np.asarray(bytearray(uploaded_file.getvalue()), dtype=np.uint8)
-    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    file_bytes = np.asarray(bytearray(uploaded_file.getvalue()),dtype=np.uint8)
+    image = cv2.imdecode(file_bytes,cv2.IMREAD_COLOR)
 
     if image is None:
-        st.error("❌ Could not load the image. Please upload a valid file.")
+        st.error("Invalid image.")
     else:
-        st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption='Original Image', use_column_width=True)
+        st.image(cv2.cvtColor(image,cv2.COLOR_BGR2RGB),caption='Original',use_column_width=True)
 
-        # Apply filters
-        blurred, sobel, laplacian, edges, morph, adaptive_thresh = spatial_filtering(image)
+        outputs = spatial_filtering(image)
+        (blurred,sobel,laplacian,edges,morph,adaptive,clahe_img,otsu,gabor_img) = outputs
 
-        # Filter Visualizations
-        st.markdown("### 🔍 Spatial Filter Results")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.image(blurred, caption="Gaussian Blur", use_column_width=True)
-            st.image(sobel, caption="Sobel Edge Detection", use_column_width=True)
-        with col2:
-            st.image(laplacian, caption="Laplacian Edge Map", use_column_width=True)
-            st.image(edges, caption="Canny Edges", use_column_width=True)
-        with col3:
-            st.image(morph, caption="Morphological Top Hat", use_column_width=True)
-            st.image(adaptive_thresh, caption="Adaptive Threshold", use_column_width=True)
+        st.markdown("### Spatial Filters")
+        c1,c2,c3 = st.columns(3)
+        with c1:
+            st.image(blurred,caption="Gaussian Blur",use_column_width=True)
+            st.image(sobel,caption="Sobel",use_column_width=True)
+            st.image(clahe_img,caption="CLAHE",use_column_width=True)
+        with c2:
+            st.image(laplacian,caption="Laplacian",use_column_width=True)
+            st.image(edges,caption="Canny",use_column_width=True)
+            st.image(otsu,caption="Otsu Threshold",use_column_width=True)
+        with c3:
+            st.image(morph,caption="Top Hat",use_column_width=True)
+            st.image(adaptive,caption="Adaptive Threshold",use_column_width=True)
+            st.image(gabor_img,caption="Gabor Texture",use_column_width=True)
 
-        # Analysis
-        st.markdown("### 🧠 Color and Texture Analysis")
-        mean_hue, mean_sat, mean_lightness, lap_var = analyze_color_texture(image)
-        label, desc, spoilage_score = classify_spoilage(mean_hue, mean_sat, mean_lightness, lap_var)
+        mean_h,mean_s,mean_l,lap_var,local_var = analyze_color_texture(image)
+        label,desc,score = classify_spoilage(mean_h,mean_s,mean_l,lap_var,local_var)
 
-        col_a, col_b, col_c, col_d = st.columns(4)
-        col_a.metric("Mean Hue", f"{mean_hue:.2f}")
-        col_b.metric("Mean Saturation", f"{mean_sat:.2f}")
-        col_c.metric("Mean Lightness (LAB)", f"{mean_lightness:.2f}")
-        col_d.metric("Texture Variance", f"{lap_var:.2f}")
+        st.markdown("### Color and Texture Analysis")
+        a,b,c,d,e = st.columns(5)
+        a.metric("Hue",f"{mean_h:.2f}")
+        b.metric("Saturation",f"{mean_s:.2f}")
+        c.metric("Lightness",f"{mean_l:.2f}")
+        d.metric("Laplacian Var",f"{lap_var:.2f}")
+        e.metric("Local Var",f"{local_var:.2f}")
 
-        st.markdown(f"### 🍇 Spoilage Classification: **{label}**")
+        st.markdown(f"### Result: {label}")
         st.info(desc)
-        st.progress(int(np.clip(spoilage_score, 0, 100)))
+        st.progress(int(np.clip(score,0,100)))
 
-        # Histogram
-        st.markdown("### 📊 Color Histogram")
-        hist_fig = plot_histogram(image)
-        st.pyplot(hist_fig)
+        st.markdown("### Histogram")
+        fig = plot_histogram(image)
+        st.pyplot(fig)
 
 else:
-    st.info("Please upload an image file (png, jpg, jpeg, bmp).")
+    st.info("Upload a valid image.")
