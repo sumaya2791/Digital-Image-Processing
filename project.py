@@ -416,3 +416,4 @@ if uploaded_file and allowed_file(uploaded_file.name):
 else:
     st.info("Please upload an image file (png, jpg, jpeg, bmp).")
 
+
