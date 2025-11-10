@@ -3,8 +3,13 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
+# ------------------------- Streamlit Config -------------------------
+st.set_page_config(page_title="Smart Fruit Spoilage Detector", layout="wide")
+st.title("🍎 Smart Fruit Spoilage Detection System")
+
 # ------------------------- Utility -------------------------
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp'}
+
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -19,11 +24,32 @@ def to_rgb(img_bgr):
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
 def overlay_mask_on_rgb(rgb, mask, color=(255, 0, 0), alpha=0.4):
-    # mask: uint8 0/255
-    overlay = rgb.copy().astype(np.float32)
-    m = (mask > 0)[..., None]
-    overlay[m] = overlay[m] * (1 - alpha) + np.array(color, dtype=np.float32) * alpha
-    return np.clip(overlay, 0, 255).astype(np.uint8)
+    """
+    Safely overlays a semi-transparent color on the RGB image wherever mask > 0.
+    Works with 2D or 3D masks and auto-resizes the mask if needed.
+    Fixes the IndexError by avoiding advanced boolean indexing and using np.where.
+    """
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("rgb must be an HxWx3 array")
+
+    # Ensure mask is 2D and matches image size
+    if mask.ndim == 3:
+        mask2d = mask[..., 0]
+    else:
+        mask2d = mask
+
+    if mask2d.shape[:2] != rgb.shape[:2]:
+        mask2d = cv2.resize(mask2d, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    mask_bool = mask2d > 0
+
+    overlay = rgb.astype(np.float32)
+    color_arr = np.array(color, dtype=np.float32).reshape(1, 1, 3)
+    blended = overlay * (1 - alpha) + color_arr * alpha
+
+    # Apply blended color only where mask is True
+    result = np.where(mask_bool[..., None], blended, overlay)
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 def draw_contours_and_boxes(rgb, mask, min_area=300, thickness=2):
     out = rgb.copy()
@@ -51,7 +77,7 @@ def colorize_heatmap(prob_map):
     heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
     return heat_rgb
 
-# ------------------------- Spatial Filters (kept) -------------------------
+# ------------------------- Spatial Filters -------------------------
 def spatial_filtering(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
@@ -83,7 +109,7 @@ def spatial_filtering(image):
 
     return blurred, sobel_combined, laplacian, edges, morph, adaptive_thresh
 
-# ------------------------- Color & Texture Analysis (kept) -------------------------
+# ------------------------- Color & Texture Analysis -------------------------
 def analyze_color_texture(image):
     # Convert to HSV for color analysis
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -91,7 +117,6 @@ def analyze_color_texture(image):
 
     mean_hue = np.mean(h)
     mean_sat = np.mean(s)
-    mean_val = np.mean(v)
 
     # Convert to LAB (perceptual lightness)
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
@@ -157,8 +182,8 @@ def compute_spoilage_map(image_bgr, weights=None, smooth_ksize=5):
     )
     prob_map = normalize(prob_map)
 
-    # Optional smoothing
-    k = max(3, smooth_ksize | 1)  # make odd
+    # Optional smoothing (ensure odd kernel)
+    k = max(3, smooth_ksize | 1)
     prob_map = cv2.GaussianBlur(prob_map, (k, k), 0)
 
     feature_maps = {
@@ -195,18 +220,16 @@ def segment_spoilage(image_bgr, sensitivity=50, min_area=300, morph_kernel=5, we
     # Remove small connected components
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
     clean = np.zeros_like(mask)
-    kept_areas = []
     for i in range(1, num_labels):  # skip background
         area = stats[i, cv2.CC_STAT_AREA]
         if area >= max(1, int(min_area)):
             clean[labels == i] = 255
-            kept_areas.append(area)
 
     # Extract contours for visualization
     contours_kept, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     return clean, prob_map, contours_kept
 
-# ------------------------- Histogram Plot (kept) -------------------------
+# ------------------------- Histogram Plot -------------------------
 def plot_histogram(image):
     color = ('b', 'g', 'r')
     fig, ax = plt.subplots(figsize=(8, 4))
@@ -221,7 +244,7 @@ def plot_histogram(image):
     fig.tight_layout()
     return fig
 
-# ------------------------- Spoilage Classification (updated) -------------------------
+# ------------------------- Global Spoilage Classification -------------------------
 def classify_spoilage_global(prob_map, mask):
     # Area fraction and mean intensity inside mask
     H, W = prob_map.shape
@@ -246,11 +269,7 @@ def classify_spoilage_global(prob_map, mask):
 
     return label, desc, severity, area_fraction, mean_intensity
 
-# ------------------------- Streamlit App -------------------------
-st.set_page_config(page_title="Smart Fruit Spoilage Detector", layout="wide")
-st.title("🍎 Smart Fruit Spoilage Detection System")
-
-# Sidebar controls
+# ------------------------- Sidebar Controls -------------------------
 st.sidebar.header("⚙️ Detection Controls")
 sensitivity = st.sidebar.slider("Detection sensitivity", 0, 100, 55, help="Higher = detect more (lower threshold).")
 min_area = st.sidebar.slider("Min region area (px)", 50, 10000, 800, step=50)
@@ -259,6 +278,7 @@ overlay_alpha = st.sidebar.slider("Overlay opacity", 0.1, 0.9, 0.4, 0.05)
 show_debug = st.sidebar.checkbox("Show debug feature maps", value=False)
 show_filters = st.sidebar.checkbox("Show spatial filter results", value=False)
 
+# ------------------------- File Uploader -------------------------
 uploaded_file = st.file_uploader("Upload a fruit image", type=list(ALLOWED_EXTENSIONS))
 
 if uploaded_file and allowed_file(uploaded_file.name):
@@ -285,7 +305,8 @@ if uploaded_file and allowed_file(uploaded_file.name):
         overlay_rgb = overlay_mask_on_rgb(image_rgb, mask, color=(255, 0, 0), alpha=overlay_alpha)
         boxed_rgb, _ = draw_contours_and_boxes(overlay_rgb, mask, min_area=min_area, thickness=2)
         heat_rgb = colorize_heatmap(prob_map)
-        heat_overlay = overlay_mask_on_rgb(image_rgb, (normalize(prob_map) * 255).astype(np.uint8), color=(255, 0, 0), alpha=overlay_alpha)
+        # Blend full heatmap over the image for better visualization
+        heat_overlay = cv2.addWeighted(image_rgb, 1 - overlay_alpha, heat_rgb, overlay_alpha, 0)
 
         col1, col2 = st.columns(2)
         with col1:
@@ -317,7 +338,7 @@ if uploaded_file and allowed_file(uploaded_file.name):
             d3.image((normalize(fmap["texture"]) * 255).astype(np.uint8), caption="Texture (Laplacian)", use_column_width=True, clamp=True)
             d4.image((normalize(fmap["brown"]) * 255).astype(np.uint8), caption="Brownness (Lab)", use_column_width=True, clamp=True)
 
-        # Keep your original analysis
+        # Keep original analysis
         st.markdown("### 🧠 Color and Texture Analysis")
         mean_hue, mean_sat, mean_lightness, lap_var = analyze_color_texture(image_bgr)
         col_a, col_b, col_c, col_d = st.columns(4)
